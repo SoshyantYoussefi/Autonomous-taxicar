@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug path_algoritm",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "C:/Users/gitar/Desktop/TSEA29/code/kommunikationsmodul/src/path_algoritm.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "C:/Users/gitar/Desktop/TSEA29/code/kommunikationsmodul/src",
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "miDebuggerPath": "gdb",
+            "preLaunchTask": "build path algoritm"
+        }
+    ]
+}

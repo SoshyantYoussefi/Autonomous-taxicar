@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import math
+import time
+from collections import deque
+import socket, os
+import cv2
+from cameraview import FrameTCPStreamer
+
+# ========================= Tunables =========================
+FRAME_W, FRAME_H = 640, 480
+
+JPEG_QUALITY = 60
+
+# Look at less of the image: only the closest slice + crop sides
+ROI_TOP = 0.58
+ROI_BOTTOM = 0.15 
+HORIZ_MARGIN_FRACTION = 0.12     # cut 10% from both left/right inside ROI
+
+# Thresholding / morphology
+ADAPTIVE = True                  # True=adaptive (robust), False=Otsu (faster)
+BINARY_INV = True                # lines=1, floor=0 after threshold
+MORPH_OPEN = (3, 3)              # remove speckles
+MORPH_CLOSE = (7, 7)             # close gaps in line segments
+
+# Scan / fitting
+ROW_STEP = 4
+MIN_PIXELS_PER_SIDE = 16         # stronger evidence per scanline half
+HEADING_FAR_FRACTION = 0.25      # heading baseline (as fraction of working image height)
+
+# Smoothing (robust): lower ALPHA = steadier, higher = more responsive
+ALPHA = 0.15
+MEDIAN_WINDOW = 9                # odd number; rolling median length
+LANE_WIDTH_TOL = 0.25            # accept width within ±25% of recent median
+LANE_WIDTH_MIN_PX = 20           # ignore absurdly thin lanes
+
+# Visualization
+COLOR_DISPLAY = False            # False: show binary/fit view; True: overlay on color
+SHOW_ROI_BOX = True
+
+# Optional perspective warp (start False; you can enable later and tune SRC/DST)
+USE_WARP = False
+WARP_W, WARP_H = 480, 320
+SRC = np.float32([
+    [FRAME_W*0.15, FRAME_H*0.65],  # near-left
+    [FRAME_W*0.85, FRAME_H*0.65],  # near-right
+    [FRAME_W*0.55, FRAME_H*0.40],  # far-right
+    [FRAME_W*0.45, FRAME_H*0.40],  # far-left
+])
+DST = np.float32([
+    [WARP_W*0.15, WARP_H*0.95],
+    [WARP_W*0.85, WARP_H*0.95],
+    [WARP_W*0.85, WARP_H*0.05],
+    [WARP_W*0.15, WARP_H*0.05],
+])
+
+# --- SOCKET: telemetry settings (UDP broadcast by default)
+# --- FILE OUTPUT: where to write the 7-bit heading
+SOCKET_PATH = "/tmp/cam_offset.sock"  # change path if needed
+HEADING_MIN_DEG = -45.0
+HEADING_MAX_DEG = 45.0
+
+_udps = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+# ========================= State / histories =========================
+left_x_history  = deque(maxlen=5)
+right_x_history = deque(maxlen=5)
+offset_history  = deque(maxlen=10)
+lane_width_hist = deque(maxlen=15)   # for outlier rejection
+
+# Smoothed outputs
+heading_sm = None
+lateral_sm = None
+HEADING_LATERAL_COUPLING = 0.0
+
+# ========================= Camera (yours, unchanged) =========================
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (FRAME_W, FRAME_H)})
+picam2.configure(config)
+picam2.start()
+
+streamer = FrameTCPStreamer(host="0.0.0.0", port=6000)
+streamer.start()
+
+USE_CAMERA = False
+IMAGE_PATH = "kamerabild.png"
+
+def capture_frame(): 
+    frame = picam2.capture_array() 
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) 
+    return frame
+
+def preprocess_frame(frame):
+    # --- 1. Konvertera till gråskala ---
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # --- 2. Gamma-korrigering för att dämpa reflexer ---
+    gamma = 0.6  # <1 mörkar ljusa reflexer, framhäver mörka linjer
+    invGamma = 1.0 / gamma
+    table = np.array([(i / 255.0) ** invGamma * 255 for i in np.arange(256)]).astype("uint8")
+    gray = cv2.LUT(gray, table)
+
+    # --- 3. Skapa bakgrundsbild (för att ta bort skuggor) ---
+    # Ingen kernel/dilate -> direkt medianBlur
+    bg = cv2.medianBlur(gray, 15)  # 13–17 fungerar bra
+
+    # --- 4. Subtrahera bakgrund och invertera ---
+    diff = cv2.absdiff(gray, bg)
+    no_shadow = cv2.bitwise_not(diff)
+
+    # --- 5. Normalisera kontrasten ---
+    no_shadow = cv2.normalize(no_shadow, None, 0, 255, cv2.NORM_MINMAX)
+
+    # --- 6. Brusreducering ---
+    no_shadow = cv2.GaussianBlur(no_shadow, (5, 5), 0)
+    return no_shadow
+
+
+
+def quantize_heading_deg_to_7bit(heading_deg: float, lo=-45.0, hi=45.0) -> int:
+    clamped = max(lo, min(hi, heading_deg))
+    norm = (clamped - lo) / (hi - lo)
+    return int(round(norm * 100)) & 0x7F  # 0..100
+
+
+# ========================= Helpers =========================
+def threshold_black(gray_roi):
+    """
+    Robust tröskling för svart tejp:
+    - Adaptiv lokal tröskel (Gaussian) hanterar reflektioner/ojämnt ljus.
+    - BINARY_INV styr om svart tejp ska bli vita pixlar (1) eller tvärtom.
+    - Morfologi städar bort brus och små glapp.
+    """
+    # Säkerställ rätt typ/contiguous
+    g = np.ascontiguousarray(gray_roi, dtype=np.uint8)
+
+    # liten blur före tröskling för att dämpa sensbrus
+    g = cv2.GaussianBlur(g, (5, 5), 0) # kan tas bort
+
+    # ---- Adaptiv tröskling ----
+    # blockSize: udda tal >= 3. 25–35 är bra start (31 funkar ofta bäst).
+    # C: positiv offset. Öka (t.ex. 5→9) om tejpen blir ljus av reflexer.
+    blockSize = 31
+    C = 7
+    thresh_type = cv2.THRESH_BINARY_INV if BINARY_INV else cv2.THRESH_BINARY
+
+    th = cv2.adaptiveThreshold(
+        g,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        thresh_type,
+        blockSize,
+        C
+    )
+
+    # ---- Morfologi: städa masken ----
+    if MORPH_OPEN is not None:
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones(MORPH_OPEN, np.uint8))
+    if MORPH_CLOSE is not None:
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones(MORPH_CLOSE, np.uint8))
+
+    return th
+
+
+def perspective_warp(mask_full, M):
+    return cv2.warpPerspective(mask_full, M, (WARP_W, WARP_H), flags=cv2.INTER_LINEAR)
+
+def find_edges_split(binary_img, step=ROW_STEP):
+    """
+    Split each scanline into left/right halves, take median x of 'on' pixels in each half.
+    Fit x = a*y + b (image coords with y downwards).
+    """
+    h, w = binary_img.shape
+    half = w // 2
+
+    xs_left, ys_left, xs_right, ys_right = [], [], [], []
+
+    for y in range(h - 1, int(h * 0.25), -step):
+        row = binary_img[y, :]
+        left_idxs = np.where(row[:half] > 0)[0]
+        right_idxs = np.where(row[half:] > 0)[0]
+
+        if left_idxs.size >= MIN_PIXELS_PER_SIDE:
+            xs_left.append(int(np.median(left_idxs)))
+            ys_left.append(y)
+
+        if right_idxs.size >= MIN_PIXELS_PER_SIDE:
+            xs_right.append(int(np.median(right_idxs) + half))
+            ys_right.append(y)
+
+    left_fit  = np.polyfit(ys_left,  xs_left,  1) if len(xs_left)  > 8 else None
+    right_fit = np.polyfit(ys_right, xs_right, 1) if len(xs_right) > 8 else None
+
+    return left_fit, right_fit, (xs_left, ys_left, xs_right, ys_right)
+
+def centerline_and_errors(left_fit, right_fit, img_shape, cam_center_x=None):
+    h, w = img_shape
+    y_near = h - 1
+    y_far  = int(h * HEADING_FAR_FRACTION)
+
+    if left_fit is None or right_fit is None:
+        return None, None, None, None, None
+
+    def eval_line(fit, y): return fit[0]*y + fit[1]
+
+    xL_near = eval_line(left_fit,  y_near)
+    xR_near = eval_line(right_fit, y_near)
+    xL_far  = eval_line(left_fit,  y_far)
+    xR_far  = eval_line(right_fit, y_far)
+
+    x_center_near = 0.5 * (xL_near + xR_near)
+    x_center_far  = 0.5 * (xL_far  + xR_far)
+
+    # heading: angle of centerline vs. vertical (degrees)
+    dy = (y_far - y_near)
+    dx = (x_center_far - x_center_near)
+    heading_rad = math.atan2(dx, -dy)  # -dy because y increases downward
+    heading_deg = math.degrees(heading_rad)
+
+    # lateral offset (normalized by lane width at near row)
+    if cam_center_x is None:
+        cam_center_x = w / 2
+    lateral_px = x_center_near - cam_center_x
+    lane_width_px = abs(xR_near - xL_near)
+    lateral_norm = lateral_px / lane_width_px if lane_width_px > 1 else 0.0
+
+    return (x_center_near, x_center_far), heading_deg, lateral_px, lateral_norm, (xL_near, xR_near)
+
+def robust_smooth(hist_deque, new_value, alpha=ALPHA, median_window=MEDIAN_WINDOW, _state=dict()):
+    """
+    Rolling median over last N, then EMA on top.
+    Maintains separate EMA state per deque id.
+    """
+    hist_deque.append(float(new_value))
+    vals = list(hist_deque)[-median_window:]
+    med = np.median(vals)
+    key = id(hist_deque)
+    prev = _state.get(key, None)
+    ema = med if prev is None else (1 - alpha) * prev + alpha * med
+    _state[key] = ema
+    return ema
+
+# ========================= Main =========================
+def main():
+    global heading_sm, lateral_sm
+
+    # Optional warp precompute
+    if USE_WARP:
+        M = cv2.getPerspectiveTransform(SRC, DST)
+    else:
+        M = None
+
+    # For FPS readout (optional)
+    fps_t0, fps_cnt = time.time(), 0
+
+    # Smoother histories
+    heading_hist = deque(maxlen=50)
+    lateral_hist = deque(maxlen=50)
+
+    while True:
+        frame = capture_frame()
+        if frame.shape[:2] != (FRAME_H, FRAME_W):
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+        gray  = preprocess_frame(frame)
+
+        # ----- ROI: bottom slice + side margins -----
+        y_start = int(FRAME_H * (1-ROI_TOP))
+        y_end = int(FRAME_H * (1-ROI_BOTTOM))
+        x_margin = int(FRAME_W * HORIZ_MARGIN_FRACTION)
+
+        gray_roi = gray[y_start:y_end, :]
+        gray_roi = gray_roi[:, x_margin:FRAME_W - x_margin]
+
+        # Threshold + cleanup
+        bin_roi = threshold_black(gray_roi)
+
+        # Rebuild a full-size binary mask (useful for uniform downstream handling / warp)
+        full_bin = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
+        full_bin[y_start:y_end, x_margin:FRAME_W - x_margin] = bin_roi
+
+        # Working binary image
+        work = perspective_warp(full_bin, M) if (USE_WARP and M is not None) else full_bin
+
+        # Detect edges and fit lines
+        left_fit, right_fit, pts = find_edges_split(work, step=ROW_STEP)
+
+        # Compute geometric errors
+        centerline, heading_deg, lateral_px, lateral_norm, near_edges = centerline_and_errors(
+            left_fit, right_fit, work.shape
+        )
+
+        # ----- Outlier rejection via lane width gating -----
+        valid_measurement = False
+        if near_edges is not None:
+            xL_near, xR_near = near_edges
+            lane_w = abs(xR_near - xL_near)
+            if lane_w > LANE_WIDTH_MIN_PX:
+                lane_width_hist.append(lane_w)
+                if len(lane_width_hist) >= 5:
+                    w_med = np.median(lane_width_hist)
+                    if (1 - LANE_WIDTH_TOL) * w_med <= lane_w <= (1 + LANE_WIDTH_TOL) * w_med:
+                        valid_measurement = True
+                else:
+                    valid_measurement = True
+
+        # Update histories for diagnostics
+        if near_edges is not None:
+            left_x_history.append(near_edges[0])
+            right_x_history.append(near_edges[1])
+        if lateral_norm is not None and valid_measurement:
+            offset_history.append(lateral_norm)
+
+        # ----- Smoothing (only accept valid frames) -----
+        if valid_measurement:
+            if heading_deg is not None:
+                heading_sm = robust_smooth(heading_hist, heading_deg, ALPHA, MEDIAN_WINDOW)
+            if lateral_norm is not None:
+                lateral_sm = robust_smooth(lateral_hist, lateral_norm, ALPHA, MEDIAN_WINDOW)
+        # else: coast on last good (do not update)
+
+        heading_corr = heading_sm
+        if (heading_sm is not None) and (lateral_sm is not None):
+            heading_corr = heading_sm - HEADING_LATERAL_COUPLING * lateral_sm
+
+        if heading_corr is not None:
+            q = quantize_heading_deg_to_7bit(heading_corr)
+            try:
+                _udps.sendto(bytes([q]), SOCKET_PATH)  # 1 byte to local socket file
+            except FileNotFoundError:
+                # Receiver not up yet; ignore and keep running
+                pass
+            except Exception:
+                pass  # swallow transient errors to avoid stalling vision loop
+
+
+        # ========================= Visualization =========================
+        if COLOR_DISPLAY:
+            vis = frame.copy()
+        else:
+            vis = cv2.cvtColor(work, cv2.COLOR_GRAY2BGR)       
+
+        # Draw fitted points/lines in the working space
+        h, w = work.shape
+        if left_fit is not None:
+            for y in range(0, h, 10):
+                x = int(left_fit[0]*y + left_fit[1])
+                if 0 <= x < w:
+                    cv2.circle(vis, (x, y), 2, (0, 255, 0), -1)
+        if right_fit is not None:
+            for y in range(0, h, 10):
+                x = int(right_fit[0]*y + right_fit[1])
+                if 0 <= x < w:
+                    cv2.circle(vis, (x, y), 2, (0, 0, 255), -1)
+
+        if centerline is not None:
+            x0c, x1c = int(centerline[0]), int(centerline[1])
+            y0c, y1c = h - 1, int(h * HEADING_FAR_FRACTION)
+            cv2.line(vis, (x0c, y0c), (x1c, y1c), (255, 0, 0), 2)
+            cv2.line(vis, (w // 2, h - 20), (w // 2, h - 60), (255, 255, 255), 1)
+
+        status = "coasting (outlier)" if not valid_measurement else "OK"
+        if (heading_sm is None) or (lateral_sm is None):
+            txt = f"detecting..."
+        else:
+            txt = f"{status} | heading {heading_sm:+.1f} deg | lateral {lateral_sm:+.3f} lanes"
+        cv2.putText(vis, txt, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+       # cv2.imshow("lane view (binary or color)", vis)
+
+        # Visualize actual ROI on original frame (optional but handy)
+        #if SHOW_ROI_BOX:
+         #   roi_frame = frame.copy()
+          #  cv2.rectangle(roi_frame,
+           #               (x_margin, y_start),
+            #              (FRAME_W - x_margin, y_end),
+             #             (0, 255, 255), 2)
+            #cv2.imshow("Camera with ROI", roi_frame)
+
+        if streamer.has_client():
+            ok, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+            if ok:
+                streamer.push_jpeg(jpg.tobytes()) 
+
+        # ----- Key handling -----
+X        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord('q')):
+            break
+
+        # FPS (optional print)
+        fps_cnt += 1
+        if fps_cnt >= 60:
+            now = time.time()
+            fps = fps_cnt / (now - fps_t0)
+            fps_t0, fps_cnt = now, 0
+            # print(f"FPS: {fps:.1f}")
+
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        try:
+            streamer.stop()
+        except Exception:
+            pass
+        try:
+            picam2.stop()
+        except Exception:
+            pass

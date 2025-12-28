@@ -1,0 +1,14 @@
+{
+  "move_data": {
+    "forward_down": 1,
+    "forward_up": 2,
+    "backward_down": 3,
+    "backward_up": 4,
+    "left_down": 5,
+    "left_up": 6,
+    "right_down": 7,
+    "right_up": 8,
+    "stop_down": 9,
+    "stop_up": 10
+  }
+}
